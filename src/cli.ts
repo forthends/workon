@@ -68,16 +68,24 @@ function createProductionKiller(): ProcessKiller {
       }
     },
     async killGroup(pid: number): Promise<void> {
-      process.kill(-pid, 'SIGTERM');
+      try {
+        process.kill(-pid, 'SIGTERM');
+      } catch {
+        return;
+      }
       await new Promise<void>((resolve) => setTimeout(resolve, KILL_GRACE_MS));
-      process.kill(-pid, 'SIGKILL');
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+        // 进程组已经退出
+      }
     },
   };
 }
 
 export async function startDaemon(
   cwd: string,
-  env?: { notify?: typeof createMacNotifier },
+  env?: { notify?: typeof createMacNotifier; killer?: ProcessKiller },
 ): Promise<{ close(): Promise<void> }> {
   const ws = workspaceRoot(cwd);
   const config = loadConfig(ws);
@@ -96,6 +104,18 @@ export async function startDaemon(
     clock,
     workspaceRoot: ws,
   });
+
+  try {
+    await recoverInterrupted({
+      store,
+      clock,
+      killer: env?.killer ?? createProductionKiller(),
+      notify: notifier.notify.bind(notifier),
+    });
+  } catch (error) {
+    store.close();
+    throw error;
+  }
 
   const server = createHttpServer({
     delivery,
@@ -133,13 +153,7 @@ export async function startDaemon(
   daemonPromise = runDaemon({
     delivery,
     role,
-    recover: () =>
-      recoverInterrupted({
-        store,
-        clock,
-        killer: createProductionKiller(),
-        notify: notifier.notify.bind(notifier),
-      }),
+    recover: async () => {},
     wake,
     signal: abort.signal,
   });

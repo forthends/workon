@@ -1,9 +1,12 @@
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runCli, startDaemon } from '../src/cli.js';
+import { createIds } from '../src/ids.js';
 import { SKILL_TEMPLATE } from '../src/skills.js';
+import { openStore } from '../src/store.js';
 import { tempDir } from './helpers.js';
 
 const cleanups: Array<() => void> = [];
@@ -124,4 +127,94 @@ describe('cli', () => {
 
     await new Promise<void>((resolve, reject) => placeholder.close((error) => (error ? reject(error) : resolve())));
   });
+
+  it('starts when the recorded pid is alive but is not a process group', async () => {
+    const { dir, cleanup } = tempDir('workon-cli-kill-');
+    cleanups.push(cleanup);
+    await runCli(['init'], makeIo(dir).io);
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    cleanups.push(() => {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('spawn', () => resolve());
+    });
+    const port = await reservePort();
+    writeFileSync(
+      path.join(dir, '.workon', 'config.json'),
+      `${JSON.stringify({ port, clients: { qoder: 'workon-missing-qoder', cursor: 'workon-missing-agent' } }, null, 2)}\n`,
+      'utf8',
+    );
+    seedInterrupted(dir, child.pid ?? 0);
+
+    const daemon = await startDaemon(dir, { notify: () => ({ notify() {} }) });
+    await daemon.close();
+
+    expect(child.exitCode).toBeNull();
+    const store = openStore(path.join(dir, '.workon', 'workon.sqlite'), createIds());
+    const status = store.getRequirement(store.listRequirements()[0]?.id ?? '')?.status;
+    store.close();
+    expect(['queued', 'in_progress', 'needs_human']).toContain(status);
+  });
+
+  it('does not listen when recovery fails', async () => {
+    const { dir, cleanup } = tempDir('workon-cli-recover-');
+    cleanups.push(cleanup);
+    await runCli(['init'], makeIo(dir).io);
+    const port = await reservePort();
+    writeFileSync(
+      path.join(dir, '.workon', 'config.json'),
+      `${JSON.stringify({ port, clients: { qoder: 'qoder', cursor: 'agent' } }, null, 2)}\n`,
+      'utf8',
+    );
+    seedInterrupted(dir, 1);
+
+    await expect(
+      startDaemon(dir, {
+        notify: () => ({ notify() {} }),
+        killer: {
+          isAlive: () => true,
+          killGroup: async () => {
+            throw new Error('杀进程失败');
+          },
+        },
+      }),
+    ).rejects.toThrow('杀进程失败');
+
+    const probe = createServer();
+    await new Promise<void>((resolve, reject) => {
+      probe.once('error', reject);
+      probe.listen(port, '127.0.0.1', () => resolve());
+    });
+    await new Promise<void>((resolve, reject) => probe.close((error) => (error ? reject(error) : resolve())));
+  });
 });
+
+async function reservePort(): Promise<number> {
+  const placeholder = createServer();
+  await new Promise<void>((resolve) => placeholder.listen(0, '127.0.0.1', resolve));
+  const address = placeholder.address();
+  if (!address || typeof address === 'string') throw new Error('expected port');
+  await new Promise<void>((resolve, reject) => placeholder.close((error) => (error ? reject(error) : resolve())));
+  return address.port;
+}
+
+function seedInterrupted(dir: string, pid: number): void {
+  const store = openStore(path.join(dir, '.workon', 'workon.sqlite'), createIds());
+  const stamp = new Date().toISOString();
+  const created = store.insertRequirement({ text: '中断的需求', now: stamp });
+  store.updateRequirement(created.id, 'queued', { status: 'in_progress', updatedAt: stamp });
+  store.insertAttempt({
+    requirementId: created.id,
+    n: 1,
+    clientId: 'qoder',
+    status: 'running',
+    pid,
+    runDir: null,
+    error: null,
+    startedAt: stamp,
+    finishedAt: null,
+  });
+  store.close();
+}
