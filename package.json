@@ -5,7 +5,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "vitest run",
-    "workon": "node --experimental-strip-types src/cli.ts"
+    "workon": "node --experimental-strip-types --experimental-transform-types --import ./scripts/register-ts.mjs src/cli.ts"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
