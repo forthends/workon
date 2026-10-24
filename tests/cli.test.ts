@@ -1,7 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { runCli } from '../src/cli.js';
+import { runCli, startDaemon } from '../src/cli.js';
 import { SKILL_TEMPLATE } from '../src/skills.js';
 import { tempDir } from './helpers.js';
 
@@ -101,5 +102,26 @@ describe('cli', () => {
     expect(stdout).toEqual([
       JSON.stringify({ id: 'req_000000000001', status: 'queued' }, null, 2),
     ]);
+  });
+
+  it('startDaemon rejects when the configured port is already in use', async () => {
+    const { dir, cleanup } = tempDir('workon-cli-port-');
+    cleanups.push(cleanup);
+    const { io: initIo } = makeIo(dir);
+    await runCli(['init'], initIo);
+
+    const placeholder = createServer();
+    await new Promise<void>((resolve) => placeholder.listen(0, '127.0.0.1', resolve));
+    const address = placeholder.address();
+    if (!address || typeof address === 'string') throw new Error('expected port');
+
+    const configPath = path.join(dir, '.workon', 'config.json');
+    writeFileSync(configPath, `${JSON.stringify({ port: address.port, clients: { qoder: 'qoder', cursor: 'agent' } }, null, 2)}\n`, 'utf8');
+
+    await expect(
+      startDaemon(dir, { notify: () => ({ notify() {} }) }),
+    ).rejects.toThrow(/端口已被占用/);
+
+    await new Promise<void>((resolve, reject) => placeholder.close((error) => (error ? reject(error) : resolve())));
   });
 });
